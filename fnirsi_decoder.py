@@ -82,8 +82,11 @@ import struct
 import csv
 import sys
 import os
+import re
 import argparse
+from collections import OrderedDict
 
+import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -643,6 +646,455 @@ def _format_vdiv(mV):
         return f"{mV:.6g}mV"
 
 
+# ---------------------------------------------------------------------------
+# Tektronix ISF (Internal Signal Format) support
+# ---------------------------------------------------------------------------
+# ISF files contain a single channel each. Multiple channels from the same
+# capture share a common prefix (e.g. tek0000CH1.isf, tek0000CH2.isf).
+#
+# File layout:
+#   ASCII header  — semicolon-separated KEY VALUE pairs
+#   :CURV #Ndddd  — IEEE 488.2 binary block prefix
+#   <binary data>  — int16 samples (signed, big- or little-endian)
+#
+# Voltage conversion: V = YZE + YMU * (raw_sample - YOF)
+# Time for sample i: t = XZE + XIN * (i - PT_O)
+# ---------------------------------------------------------------------------
+
+_ISF_GROUP_RE = re.compile(r'^(tek\d+)(CH\d+)\.isf$', re.IGNORECASE)
+
+
+def _parse_isf_header(data):
+    """Parse the ASCII header of a Tektronix ISF file.
+
+    Returns (params_dict, data_offset, data_byte_count).
+    """
+    curv_pos = data.find(b':CURV ')
+    if curv_pos == -1:
+        curv_pos = data.find(b':CURVE ')
+    if curv_pos == -1:
+        raise ValueError("ISF: cannot find :CURV block in header")
+
+    header_text = data[:curv_pos].decode('ascii', errors='replace')
+
+    params = {}
+    for token in header_text.split(';'):
+        token = token.strip()
+        if not token:
+            continue
+        # Strip :PREFIX: (e.g. :WFMP:KEY VALUE → KEY VALUE)
+        while token.startswith(':'):
+            colon2 = token.find(':', 1)
+            if colon2 > 0:
+                token = token[colon2 + 1:]
+            else:
+                break
+        sp = token.find(' ')
+        if sp > 0:
+            key = token[:sp].strip()
+            val = token[sp + 1:].strip()
+            params[key] = val
+
+    # IEEE 488.2 binary block: #Ndddd...<data>
+    hash_pos = data.find(b'#', curv_pos)
+    if hash_pos == -1:
+        raise ValueError("ISF: cannot find # block marker")
+    n_digits = int(chr(data[hash_pos + 1]))
+    byte_count = int(data[hash_pos + 2:hash_pos + 2 + n_digits])
+    data_offset = hash_pos + 2 + n_digits
+
+    return params, data_offset, byte_count
+
+
+def parse_isf_file(filepath):
+    """Parse a single Tektronix ISF file.
+
+    Returns a dict with numpy arrays and metadata for one channel.
+    """
+    with open(filepath, 'rb') as f:
+        data = f.read()
+
+    params, data_offset, data_length = _parse_isf_header(data)
+
+    byt_n = int(params.get('BYT_N', 2))
+    bn_f = params.get('BN_F', 'RI')       # RI = signed, RP = unsigned
+    byt_o = params.get('BYT_O', 'MSB')    # MSB or LSB
+    nr_p = int(params.get('NR_P', 0))
+
+    xin = float(params.get('XIN', 0))     # sample interval (s)
+    xze = float(params.get('XZE', 0))     # time zero (s)
+    pt_o = int(params.get('PT_O', 0))     # point offset
+
+    ymu = float(params.get('YMU', 1))     # Y multiplier (V/count)
+    yof = float(params.get('YOF', 0))     # Y offset (digitizer levels)
+    yze = float(params.get('YZE', 0))     # Y zero (V)
+
+    vscale = float(params.get('VSCALE', 0))   # V/div
+    hscale = float(params.get('HSCALE', 0))   # time/div (s)
+    vpos = float(params.get('VPOS', 0))
+    voffset = float(params.get('VOFFSET', 0))
+    hdelay = float(params.get('HDELAY', 0))
+
+    wfi = params.get('WFI', '').strip('"')
+
+    # Determine numpy dtype
+    if byt_o == 'MSB':
+        endian = '>'
+    else:
+        endian = '<'
+    if byt_n == 2:
+        dtype = np.dtype(f'{endian}i2' if bn_f == 'RI' else f'{endian}u2')
+    elif byt_n == 1:
+        dtype = np.dtype('i1' if bn_f == 'RI' else 'u1')
+    else:
+        raise ValueError(f"ISF: unsupported BYT_N={byt_n}")
+
+    n_samples = data_length // byt_n
+    if n_samples != nr_p:
+        print(f"  Warning: NR_P={nr_p} but binary block has {n_samples} samples",
+              file=sys.stderr)
+
+    raw = np.frombuffer(data, dtype=dtype, count=n_samples, offset=data_offset)
+
+    # Voltage: V = YZE + YMU * (sample - YOF)
+    voltage_V = yze + ymu * (raw.astype(np.float64) - yof)
+
+    # Extract channel name and coupling from WFI string
+    ch_name = 'CH1'
+    coupling = 'DC'
+    if wfi:
+        wfi_parts = [p.strip() for p in wfi.split(',')]
+        if wfi_parts:
+            ch_name = wfi_parts[0].upper().replace(' ', '')
+            # "Ch1" → "CH1"
+            m = re.match(r'(CH)(\d+)', ch_name, re.IGNORECASE)
+            if m:
+                ch_name = f'CH{m.group(2)}'
+        if len(wfi_parts) > 1:
+            coupling = wfi_parts[1].strip().split()[0].upper()
+
+    return {
+        'ch_name': ch_name,
+        'raw': raw,
+        'voltage_V': voltage_V,
+        'n_samples': n_samples,
+        'xin': xin,
+        'xze': xze,
+        'pt_o': pt_o,
+        'ymu': ymu,
+        'yof': yof,
+        'yze': yze,
+        'vscale': vscale,
+        'hscale': hscale,
+        'vpos': vpos,
+        'voffset': voffset,
+        'hdelay': hdelay,
+        'coupling': coupling,
+        'wfi': wfi,
+    }
+
+
+def group_isf_files(filepaths):
+    """Group ISF files by capture number.
+
+    Pattern: tekNNNNCHx.isf → group by tekNNNN.
+    Ungrouped files become single-element groups keyed by stem.
+    Returns OrderedDict: capture_id → sorted list of file paths.
+    """
+    groups = OrderedDict()
+    for fp in filepaths:
+        basename = os.path.basename(fp)
+        m = _ISF_GROUP_RE.match(basename)
+        if m:
+            key = m.group(1)
+        else:
+            key = os.path.splitext(basename)[0]
+        groups.setdefault(key, []).append(fp)
+
+    for key in groups:
+        groups[key].sort()
+    return groups
+
+
+def merge_isf_channels(parsed_channels):
+    """Merge individually parsed ISF channels into a multi-channel trace.
+
+    Args:
+        parsed_channels: OrderedDict of ch_name → parse_isf_file() result.
+
+    Returns:
+        Unified trace dict with 'channels' OrderedDict and shared time axis.
+    """
+    first = next(iter(parsed_channels.values()))
+    n_samples = first['n_samples']
+    xin = first['xin']
+    xze = first['xze']
+    pt_o = first['pt_o']
+    hscale = first['hscale']
+
+    # Time axis: t[i] = XZE + XIN * (i - PT_O)   (seconds)
+    indices = np.arange(n_samples, dtype=np.float64)
+    time_s = xze + xin * (indices - pt_o)
+    time_ns = time_s * 1e9
+
+    ns_per_div = hscale * 1e9  # convert seconds to ns
+    sample_interval_ns = xin * 1e9
+
+    channels = OrderedDict()
+    for ch_name, ch in parsed_channels.items():
+        channels[ch_name] = {
+            'voltage_V': ch['voltage_V'],
+            'voltage_mV': ch['voltage_V'] * 1000.0,
+            'raw': ch['raw'],
+            'vscale': ch['vscale'],
+            'voffset': ch['voffset'],
+            'coupling': ch['coupling'],
+            'wfi': ch['wfi'],
+        }
+
+    return {
+        'model': 'TEK_ISF',
+        'channels': channels,
+        'time_s': time_s,
+        'time_ns': time_ns,
+        'ns_per_div': ns_per_div,
+        'sample_interval_ns': sample_interval_ns,
+        'n_samples': n_samples,
+        'hscale': hscale,
+        'xin': xin,
+    }
+
+
+def _decimate_for_plot(y, max_points=50000):
+    """Min-max decimation that preserves signal peaks for plotting."""
+    n = len(y)
+    if n <= max_points:
+        return np.arange(n), y
+    factor = max(1, n // (max_points // 2))
+    n_chunks = n // factor
+    trimmed = y[:n_chunks * factor].reshape(n_chunks, factor)
+    y_min = trimmed.min(axis=1)
+    y_max = trimmed.max(axis=1)
+    result = np.empty(n_chunks * 2, dtype=y.dtype)
+    result[0::2] = y_min
+    result[1::2] = y_max
+    idx = np.empty(n_chunks * 2, dtype=np.int64)
+    base = np.arange(n_chunks) * factor
+    idx[0::2] = base
+    idx[1::2] = base + factor // 2
+    return idx, result
+
+
+def save_csv_isf(trace, output_path):
+    """Save ISF multi-channel trace to CSV.
+
+    Columns: time_s, CH1_V, CH2_V, ... , CH1_raw, CH2_raw, ...
+    """
+    channels = trace['channels']
+    ch_names = list(channels.keys())
+    n = trace['n_samples']
+
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        header = ['time_s']
+        header += [f'{name}_V' for name in ch_names]
+        header += [f'{name}_raw' for name in ch_names]
+        writer.writerow(header)
+
+        time_s = trace['time_s']
+        voltage_arrays = [channels[name]['voltage_V'] for name in ch_names]
+        raw_arrays = [channels[name]['raw'] for name in ch_names]
+
+        for i in range(n):
+            row = [f'{time_s[i]:.12e}']
+            for v_arr in voltage_arrays:
+                row.append(f'{v_arr[i]:.6e}')
+            for r_arr in raw_arrays:
+                row.append(int(r_arr[i]))
+            writer.writerow(row)
+
+
+def save_png_isf(trace, output_path, title=''):
+    """Save ISF trace to PNG with automatic downsampling for large data."""
+    channels = trace['channels']
+    ch_names = list(channels.keys())
+    time_ns = trace['time_ns']
+
+    factor, unit = choose_time_units(float(time_ns[-1]))
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # Channel colors (up to 4 channels)
+    colors = ['#FFD700', '#00FFFF', '#FF6BFF', '#66FF66']
+
+    for i, name in enumerate(ch_names):
+        ch = channels[name]
+        voltage_mV = ch['voltage_mV']
+        vdiv = ch['vscale']
+        label = f'{name} ({_format_vdiv(vdiv * 1000)}/div, {ch["coupling"]})'
+        color = colors[i % len(colors)]
+
+        # Decimate for plotting
+        dec_idx, dec_v = _decimate_for_plot(
+            np.asarray(voltage_mV, dtype=np.float64))
+        dec_t = time_ns[dec_idx] / factor
+
+        ax.plot(dec_t, dec_v, label=label, color=color, linewidth=0.6)
+
+    tb = format_time_per_div(trace['ns_per_div'])
+    ax.set_xlabel(f'Time ({unit})', color='white')
+    ax.set_ylabel('Voltage (mV)', color='white')
+    ax.set_title(
+        (title or os.path.basename(output_path)) + f'  [{tb}]',
+        color='white', fontsize=13)
+    ax.legend(
+        facecolor='#16213e', edgecolor='#555',
+        labelcolor='white', fontsize=10)
+    ax.grid(True, alpha=0.25, color='#446688')
+    ax.set_facecolor('#1a1a2e')
+    fig.patch.set_facecolor('#0f0f23')
+    ax.tick_params(colors='white')
+    for spine in ax.spines.values():
+        spine.set_color('#444')
+    ax.axhline(y=0, color='#666', linewidth=0.5, linestyle='--')
+
+    fig.savefig(output_path, dpi=150, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+def save_tek_csv_isf(trace, output_path, ch_name):
+    """Save a single ISF channel in Tektronix TDS-compatible CSV format."""
+    ch = trace['channels'][ch_name]
+    n = trace['n_samples']
+    xin = trace['xin']
+    hscale = trace['hscale']
+    vscale = ch['vscale']
+    voffset = ch['voffset']
+
+    time_s = trace['time_s']
+    v_data = ch['voltage_V']
+
+    trigger_sample = n // 2
+
+    header_rows = [
+        f'Record Length,{n:.6e}',
+        f'Sample Interval,{xin:.6e}',
+        f'Trigger Point,{trigger_sample:.12e}',
+        '',
+        '',
+        '',
+        f'Source,{ch_name}',
+        'Vertical Units,V',
+        f'Vertical Scale,{vscale:.6e}',
+        f'Vertical Offset,{voffset:.6e}',
+        'Horizontal Units,s',
+        f'Horizontal Scale,{hscale:.6e}',
+        'Pt Fmt,Y',
+        'Yzero,0.000000e+00',
+        'Probe Atten,1.000000e+00',
+        'Model Number,Tektronix DPO4104',
+        'Serial Number,',
+        'Firmware Version,',
+    ]
+
+    with open(output_path, 'w', newline='') as f:
+        for i in range(n):
+            t_str = f'  {float(time_s[i]):+.12f}'
+            v_str = f'  {float(v_data[i]):+.5f}'
+            if i < len(header_rows):
+                hdr = header_rows[i]
+                if hdr:
+                    f.write(f'{hdr},,{t_str},{v_str},\n')
+                else:
+                    f.write(f',,,{t_str},{v_str},\n')
+            else:
+                f.write(f',,,{t_str},{v_str},\n')
+
+
+def save_tek_bundle_isf(trace, out_dir, name, title=''):
+    """Save ISF trace as Tektronix-compatible directory bundle.
+
+    Creates ALL{name}/ with per-channel CSV and BMP plot.
+    """
+    bundle_dir = os.path.join(out_dir, f'ALL{name}')
+    os.makedirs(bundle_dir, exist_ok=True)
+
+    ch_csvs = []
+    for ch_name in trace['channels']:
+        csv_path = os.path.join(bundle_dir, f'F{name}{ch_name}.CSV')
+        save_tek_csv_isf(trace, csv_path, ch_name)
+        ch_csvs.append((ch_name, csv_path))
+
+    bmp_path = os.path.join(bundle_dir, f'F{name}TEK.BMP')
+    # Reuse the ISF PNG plotter, then convert to BMP
+    fig, ax = plt.subplots(figsize=(14, 6))
+    colors = ['#FFD700', '#00FFFF', '#FF6BFF', '#66FF66']
+    time_ns = trace['time_ns']
+    factor, unit = choose_time_units(float(time_ns[-1]))
+
+    for i, ch_name in enumerate(trace['channels']):
+        ch = trace['channels'][ch_name]
+        voltage_mV = ch['voltage_mV']
+        dec_idx, dec_v = _decimate_for_plot(
+            np.asarray(voltage_mV, dtype=np.float64))
+        dec_t = time_ns[dec_idx] / factor
+        vdiv = ch['vscale']
+        label = f'{ch_name} ({_format_vdiv(vdiv * 1000)}/div)'
+        ax.plot(dec_t, dec_v, label=label,
+                color=colors[i % len(colors)], linewidth=0.6)
+
+    tb = format_time_per_div(trace['ns_per_div'])
+    ax.set_xlabel(f'Time ({unit})', color='white')
+    ax.set_ylabel('Voltage (mV)', color='white')
+    ax.set_title(
+        (title or name) + f'  [{tb}]', color='white', fontsize=13)
+    ax.legend(facecolor='#16213e', edgecolor='#555',
+              labelcolor='white', fontsize=10)
+    ax.grid(True, alpha=0.25, color='#446688')
+    ax.set_facecolor('#1a1a2e')
+    fig.patch.set_facecolor('#0f0f23')
+    ax.tick_params(colors='white')
+    for spine in ax.spines.values():
+        spine.set_color('#444')
+    ax.axhline(y=0, color='#666', linewidth=0.5, linestyle='--')
+
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=150, bbox_inches='tight',
+                facecolor=fig.get_facecolor(), format='png')
+    plt.close(fig)
+    buf.seek(0)
+    img = Image.open(buf)
+    img.save(bmp_path, format='BMP')
+    buf.close()
+
+    return bundle_dir, ch_csvs, bmp_path
+
+
+def print_info_isf(capture_id, trace):
+    """Print ISF trace summary."""
+    channels = trace['channels']
+    ch_names = list(channels.keys())
+    n = trace['n_samples']
+    tb = format_time_per_div(trace['ns_per_div'])
+    si = format_time(trace['sample_interval_ns'])
+    total = format_time(float(trace['time_ns'][-1] - trace['time_ns'][0]))
+
+    print(f"  Capture:    {capture_id}")
+    print(f"  Model:      Tektronix DPO4104 (ISF)")
+    print(f"  Channels:   {', '.join(ch_names)}")
+    print(f"  Timebase:   {tb}")
+    print(f"  Sample int: {si}  ({n:,} samples, total {total})")
+    for name in ch_names:
+        ch = channels[name]
+        v = ch['voltage_V']
+        vpp = float(v.max() - v.min()) * 1000
+        vdiv = ch['vscale']
+        cpl = ch['coupling']
+        print(f"  {name}:        {_format_vdiv(vdiv * 1000)}/div, "
+              f"{cpl} coupling, Vpp={vpp:.2f}mV")
+
+
 def save_csv(trace, output_path):
     """Export trace data to CSV."""
     n_samples = len(trace['ch1_raw'])
@@ -1009,12 +1461,12 @@ def print_info(filepath, trace):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='FNIRSI oscilloscope WAV trace decoder — '
-                    'converts .wav traces to .csv and .png'
+        description='Oscilloscope trace decoder — '
+                    'converts .wav / .isf traces to .csv and .png'
     )
     parser.add_argument(
         'files', nargs='+', metavar='FILE',
-        help='WAV trace file(s) to decode'
+        help='Trace file(s) to decode (.wav or .isf)'
     )
     parser.add_argument(
         '-o', '--output-dir', default=None,
@@ -1026,9 +1478,9 @@ def main():
              '(ALL{name}/ directory with per-channel CSV + BMP)'
     )
     parser.add_argument(
-        '-m', '--model', default='1014d',
-        choices=['1014d', 'dpox180h'],
-        help='Oscilloscope model (default: 1014d)'
+        '-m', '--model', default='auto',
+        choices=['auto', '1014d', 'dpox180h', 'isf'],
+        help='Oscilloscope model (default: auto-detect from extension)'
     )
     parser.add_argument(
         '--vdiv', metavar='CH1[,CH2]',
@@ -1051,16 +1503,73 @@ def main():
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    model_name = 'FNIRSI DPOX180H' if args.model == 'dpox180h' else 'FNIRSI 1014D'
+    # --- Auto-detect model from file extension ---
+    model = args.model
+    if model == 'auto':
+        exts = {os.path.splitext(f)[1].lower() for f in args.files}
+        if exts == {'.isf'}:
+            model = 'isf'
+        else:
+            # Default to 1014d for .wav files; user can override with -m
+            model = '1014d'
+
+    # --- ISF (Tektronix) processing path ---
+    if model == 'isf':
+        groups = group_isf_files(args.files)
+        for capture_id, file_list in groups.items():
+            out_dir = args.output_dir or os.path.dirname(file_list[0]) or '.'
+
+            parsed_channels = OrderedDict()
+            for fp in file_list:
+                if not os.path.isfile(fp):
+                    print(f"ERROR: File not found: {fp}", file=sys.stderr)
+                    continue
+                try:
+                    ch_data = parse_isf_file(fp)
+                except ValueError as e:
+                    print(f"ERROR: {fp}: {e}", file=sys.stderr)
+                    continue
+                parsed_channels[ch_data['ch_name']] = ch_data
+
+            if not parsed_channels:
+                continue
+
+            trace = merge_isf_channels(parsed_channels)
+
+            csv_path = os.path.join(out_dir, f'{capture_id}.csv')
+            png_path = os.path.join(out_dir, f'{capture_id}.png')
+
+            save_csv_isf(trace, csv_path)
+            save_png_isf(trace, png_path,
+                         title=f'Tektronix DPO4104 — {capture_id}')
+
+            print(f"\n{'='*50}")
+            print_info_isf(capture_id, trace)
+            print(f"  CSV:        {csv_path}")
+            print(f"  PNG:        {png_path}")
+
+            if args.tek:
+                tek_name = capture_id
+                bundle_dir, ch_csvs, bmp_path = save_tek_bundle_isf(
+                    trace, out_dir, tek_name,
+                    title=f'Tektronix DPO4104 — {capture_id}')
+                print(f"  TEK dir:    {bundle_dir}")
+                for ch_name, ch_csv in ch_csvs:
+                    print(f"  TEK {ch_name}:    {ch_csv}")
+                print(f"  TEK BMP:    {bmp_path}")
+        return
+
+    # --- FNIRSI processing path (1014D / DPOX180H) ---
+    model_name = 'FNIRSI DPOX180H' if model == 'dpox180h' else 'FNIRSI 1014D'
 
     # V/div for DPOX180H
     ch1_vdiv = ch2_vdiv = None
-    if args.vdiv and args.model == 'dpox180h':
+    if args.vdiv and model == 'dpox180h':
         parts = [float(x) for x in args.vdiv.split(',')]
         ch1_vdiv = parts[0]
         ch2_vdiv = parts[1] if len(parts) > 1 else parts[0]
 
-    if args.model == 'dpox180h':
+    if model == 'dpox180h':
         def parse_fn(fp):
             return parse_trace_dpox180h(fp, ch1_vdiv, ch2_vdiv)
     else:
@@ -1091,7 +1600,7 @@ def main():
         print(f"  CSV:        {csv_path}")
         print(f"  PNG:        {png_path}")
 
-        if args.screenshot and args.model == 'dpox180h':
+        if args.screenshot and model == 'dpox180h':
             try:
                 scr_img = extract_screen_image(filepath)
                 scr_path = os.path.join(out_dir, f'{basename}_screen.png')
